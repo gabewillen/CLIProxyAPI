@@ -1166,3 +1166,78 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ForwardsSamplingPa
 		t.Fatalf("max_output_tokens must not leak into the chat request: %s", out)
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_CompactionTrigger(t *testing.T) {
+	raw := []byte(`{
+		"instructions":"base",
+		"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],
+		"tool_choice":"auto",
+		"parallel_tool_calls":true,
+		"text":{"format":{"type":"json_object"}},
+		"context_management":[{"type":"compaction"}],
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},
+			{"type":"compaction_trigger"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, true)
+	if !IsResponsesCompactionRequest(raw) {
+		t.Fatalf("expected compaction request detection")
+	}
+	if IsResponsesCompactionRequest([]byte(`{"input":"plain"}`)) {
+		t.Fatalf("string input must not be a compaction request")
+	}
+	for _, key := range []string{"tools", "tool_choice", "parallel_tool_calls", "response_format", "context_management"} {
+		if gjson.GetBytes(out, key).Exists() {
+			t.Fatalf("expected %s to be dropped: %s", key, prettyJSONForTest(out))
+		}
+	}
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", len(messages), prettyJSONForTest(out))
+	}
+	last := messages[3]
+	if last.Get("role").String() != "user" || last.Get("content").String() != responsesCompactionSummarizationPrompt {
+		t.Fatalf("expected summarization user message last: %s", prettyJSONForTest(out))
+	}
+	if bytes.Contains(out, []byte("compaction_trigger")) {
+		t.Fatalf("compaction_trigger leaked into chat request: %s", prettyJSONForTest(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_CompactionItemReplay(t *testing.T) {
+	encoded := EncodeResponsesCompactionContent("we fixed the bug")
+	raw := []byte(fmt.Sprintf(`{
+		"input":[
+			{"type":"compaction","id":"cmp_1","encrypted_content":%q},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
+		]
+	}`, encoded))
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d: %s", len(messages), prettyJSONForTest(out))
+	}
+	want := responsesCompactionReplayPrefix + "we fixed the bug" + responsesCompactionReplaySuffix
+	if messages[0].Get("role").String() != "user" || messages[0].Get("content").String() != want {
+		t.Fatalf("unexpected summary message: %s", prettyJSONForTest(out))
+	}
+	if messages[1].Get("content.0.text").String() != "next" {
+		t.Fatalf("expected trailing user message preserved: %s", prettyJSONForTest(out))
+	}
+
+	invalid := []byte(`{"input":[
+		{"type":"compaction","encrypted_content":"gAAAAABopaque"},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
+	]}`)
+	out = ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", invalid, false)
+	if n := len(gjson.GetBytes(out, "messages").Array()); n != 1 {
+		t.Fatalf("expected undecodable compaction item dropped, got %d messages: %s", n, prettyJSONForTest(out))
+	}
+	if _, ok := DecodeResponsesCompactionContent("cpa1:" + "!!!"); ok {
+		t.Fatalf("expected invalid base64 to fail decoding")
+	}
+}

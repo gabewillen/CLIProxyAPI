@@ -1349,3 +1349,129 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_Reasonin
 		})
 	}
 }
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_CompactionRequestEmitsSingleCompactionItem(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"m","tools":[{"type":"function","name":"shell"}],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"compaction_trigger"}]}`)
+	chunks := []string{
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"thinking"}}]}`,
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"choices":[{"index":0,"delta":{"content":"Summary part one. "}}]}`,
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"choices":[{"index":0,"delta":{"content":"Part two."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
+		`data: [DONE]`,
+	}
+
+	var param any
+	var events []string
+	var payloads []gjson.Result
+	for _, chunk := range chunks {
+		for _, evt := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "m", request, nil, []byte(chunk), &param) {
+			event, payload := parseOpenAIResponsesSSEEvent(t, evt)
+			events = append(events, event)
+			payloads = append(payloads, payload)
+		}
+	}
+
+	if len(events) == 0 || events[0] != "response.created" {
+		t.Fatalf("expected response.created first, got %v", events)
+	}
+	doneItems := 0
+	for i, event := range events {
+		p := payloads[i]
+		switch event {
+		case "response.output_item.done":
+			doneItems++
+			if p.Get("item.type").String() != "compaction" {
+				t.Fatalf("unexpected done item: %s", p.Raw)
+			}
+			if p.Get("output_index").Int() != 0 {
+				t.Fatalf("expected output_index 0: %s", p.Raw)
+			}
+			summary, ok := DecodeResponsesCompactionContent(p.Get("item.encrypted_content").String())
+			if !ok || summary != "Summary part one. Part two." {
+				t.Fatalf("unexpected encrypted_content %q (ok=%v)", summary, ok)
+			}
+			if !strings.HasPrefix(p.Get("item.id").String(), "cmp_") {
+				t.Fatalf("expected cmp_ id: %s", p.Raw)
+			}
+		case "response.output_item.added":
+			if p.Get("item.type").String() != "compaction" {
+				t.Fatalf("unexpected added item: %s", p.Raw)
+			}
+		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.content_part.added":
+			t.Fatalf("message/reasoning event leaked on compaction request: %s", event)
+		}
+	}
+	if doneItems != 1 {
+		t.Fatalf("expected exactly one output_item.done, got %d (%v)", doneItems, events)
+	}
+	last := payloads[len(payloads)-1]
+	if events[len(events)-1] != "response.completed" {
+		t.Fatalf("expected response.completed last, got %v", events)
+	}
+	if last.Get("response.id").String() != "chatcmpl-1" {
+		t.Fatalf("expected response.id, got %s", last.Raw)
+	}
+	output := last.Get("response.output").Array()
+	if len(output) != 1 || output[0].Get("type").String() != "compaction" {
+		t.Fatalf("expected single compaction output item: %s", last.Raw)
+	}
+	if last.Get("response.usage.total_tokens").Int() != 15 {
+		t.Fatalf("expected usage propagated: %s", last.Raw)
+	}
+	for i := 1; i < len(payloads); i++ {
+		if payloads[i].Get("sequence_number").Int() != payloads[i-1].Get("sequence_number").Int()+1 {
+			t.Fatalf("sequence numbers not contiguous: %v", events)
+		}
+	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_CompactionRequestEmptyTextStillEmitsItem(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"m","input":[{"type":"compaction_trigger"}]}`)
+	chunks := []string{
+		`data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+	}
+	var param any
+	var events []string
+	for _, chunk := range chunks {
+		for _, evt := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "m", request, nil, []byte(chunk), &param) {
+			event, payload := parseOpenAIResponsesSSEEvent(t, evt)
+			events = append(events, event)
+			if event == "response.output_item.done" {
+				summary, ok := DecodeResponsesCompactionContent(payload.Get("item.encrypted_content").String())
+				if !ok || summary != "" {
+					t.Fatalf("expected empty summary, got %q ok=%v", summary, ok)
+				}
+			}
+		}
+	}
+	if strings.Join(events, ",") != "response.created,response.in_progress,response.output_item.added,response.output_item.done,response.completed" {
+		t.Fatalf("unexpected events: %v", events)
+	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_CompactionRequest(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"compaction_trigger"}]}`)
+	raw := []byte(`{"id":"chatcmpl-3","object":"chat.completion","created":1,"choices":[{"index":0,"message":{"role":"assistant","reasoning_content":"r","content":"The summary."},"finish_reason":"length"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+
+	resp := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "m", request, nil, raw, nil)
+	output := gjson.GetBytes(resp, "output").Array()
+	if len(output) != 1 || output[0].Get("type").String() != "compaction" {
+		t.Fatalf("expected single compaction item: %s", resp)
+	}
+	summary, ok := DecodeResponsesCompactionContent(output[0].Get("encrypted_content").String())
+	if !ok || summary != "The summary." {
+		t.Fatalf("unexpected summary %q ok=%v", summary, ok)
+	}
+	if gjson.GetBytes(resp, "status").String() != "completed" || gjson.GetBytes(resp, "id").String() != "chatcmpl-3" {
+		t.Fatalf("unexpected response envelope: %s", resp)
+	}
+	if gjson.GetBytes(resp, "usage.total_tokens").Int() != 5 {
+		t.Fatalf("expected usage: %s", resp)
+	}
+}

@@ -1,12 +1,91 @@
 package responses
 
+// Codex remote compaction v2 contract (openai/codex,
+// codex-rs/core/src/compact_remote_v2.rs and compact_remote_v2_attempt.rs):
+// Codex sends a normal streaming POST /v1/responses whose input is the full
+// history plus a trailing {"type":"compaction_trigger"} item, with tools,
+// instructions and parallel_tool_calls as usual and no summarization prompt.
+// It then requires exactly one response.output_item.done item of
+// {"type":"compaction","encrypted_content":"<opaque>"} followed by
+// response.completed carrying response.id and usage. The compaction item is
+// replayed verbatim as an input item on later requests.
+//
+// Chat Completions upstreams cannot compact, so this translator performs the
+// compaction itself: a compaction_trigger request is rewritten into a
+// text-only summarization request, the response side wraps the resulting
+// summary into a single compaction item (see the response converter), and a
+// replayed compaction input item is decoded back into a user message.
+// encrypted_content is "cpa1:" + base64url(no padding) of {"v":1,"summary":s};
+// it is opaque to Codex and only ever produced and consumed by CPA.
+
 import (
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+const (
+	responsesCompactionEncodingPrefix  = "cpa1:"
+	responsesCompactionEncodingVersion = 1
+
+	// responsesCompactionSummarizationPrompt mirrors the intent of Codex's own
+	// SUMMARIZATION_PROMPT for local compaction.
+	responsesCompactionSummarizationPrompt = "You are performing context compaction. Write a thorough summary of the conversation so far that will replace it as the model's only memory of it. Include: the user's goals and constraints; every decision made and why; the current state of the work (files touched, commands run, results, errors still open); anything the user asked to remember; and the exact next steps. Do not include pleasantries. Output only the summary."
+
+	responsesCompactionReplayPrefix = "<conversation_summary>\n"
+	responsesCompactionReplaySuffix = "\n</conversation_summary>\nThe above is a summary of the earlier part of this conversation, produced when the context was compacted. Continue from it."
+)
+
+type responsesCompactionPayload struct {
+	Version int    `json:"v"`
+	Summary string `json:"summary"`
+}
+
+// EncodeResponsesCompactionContent encodes a summary into the opaque
+// encrypted_content value of a compaction output item.
+func EncodeResponsesCompactionContent(summary string) string {
+	payload, _ := json.Marshal(responsesCompactionPayload{Version: responsesCompactionEncodingVersion, Summary: summary})
+	return responsesCompactionEncodingPrefix + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+// DecodeResponsesCompactionContent reverses EncodeResponsesCompactionContent.
+// It reports false for anything CPA did not produce (e.g. a real OpenAI blob).
+func DecodeResponsesCompactionContent(encoded string) (string, bool) {
+	if !strings.HasPrefix(encoded, responsesCompactionEncodingPrefix) {
+		return "", false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(encoded, responsesCompactionEncodingPrefix))
+	if err != nil {
+		return "", false
+	}
+	var payload responsesCompactionPayload
+	if err := json.Unmarshal(raw, &payload); err != nil || payload.Version != responsesCompactionEncodingVersion {
+		return "", false
+	}
+	return payload.Summary, true
+}
+
+// IsResponsesCompactionRequest reports whether a Responses request carries a
+// Codex compaction_trigger input item.
+func IsResponsesCompactionRequest(requestRawJSON []byte) bool {
+	if len(requestRawJSON) == 0 {
+		return false
+	}
+	input := gjson.GetBytes(requestRawJSON, "input")
+	if !input.IsArray() {
+		return false
+	}
+	for _, item := range input.Array() {
+		if item.Get("type").String() == "compaction_trigger" {
+			return true
+		}
+	}
+	return false
+}
 
 // openAIResponsesSamplingParamKeys are forwarded unchanged from a Responses
 // request to the Chat Completions request.
@@ -84,6 +163,8 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		systemMessage, _ = sjson.SetBytes(systemMessage, "content", instructions.String())
 		appendMessage(systemMessage)
 	}
+
+	isCompaction := false
 
 	// Convert input array to messages
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
@@ -332,6 +413,21 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					flushDeferredMessages()
 				}
 
+			case "compaction":
+				mergeableAssistantIndex = -1
+				summary, ok := DecodeResponsesCompactionContent(item.Get("encrypted_content").String())
+				if !ok {
+					continue
+				}
+				appendPendingReasoningMessage()
+				message := []byte(`{"role":"user","content":""}`)
+				message, _ = sjson.SetBytes(message, "content", responsesCompactionReplayPrefix+summary+responsesCompactionReplaySuffix)
+				appendRegularMessage(message)
+
+			case "compaction_trigger":
+				mergeableAssistantIndex = -1
+				isCompaction = true
+
 			default:
 				mergeableAssistantIndex = -1
 			}
@@ -347,6 +443,14 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		appendMessage(msg)
 	}
 
+	if isCompaction {
+		// Text-only summarization turn: no tools or structured output.
+		summarize := []byte(`{"role":"user","content":""}`)
+		summarize, _ = sjson.SetBytes(summarize, "content", responsesCompactionSummarizationPrompt)
+		appendMessage(summarize)
+		out, _ = sjson.DeleteBytes(out, "response_format")
+	}
+
 	if len(messages) > 0 {
 		out, _ = sjson.SetRawBytes(out, "messages", translatorcommon.JoinRawArray(messages))
 	}
@@ -359,7 +463,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	for _, chatTool := range mergeResponsesRequestChatTools(root) {
 		chatCompletionsTools = append(chatCompletionsTools, gjson.ParseBytes(chatTool).Value())
 	}
-	if len(chatCompletionsTools) > 0 {
+	if len(chatCompletionsTools) > 0 && !isCompaction {
 		out, _ = sjson.SetBytes(out, "tools", chatCompletionsTools)
 		if parallelToolCalls := root.Get("parallel_tool_calls"); parallelToolCalls.Exists() {
 			out, _ = sjson.SetBytes(out, "parallel_tool_calls", parallelToolCalls.Bool())

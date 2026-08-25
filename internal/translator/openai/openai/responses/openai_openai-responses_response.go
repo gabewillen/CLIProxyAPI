@@ -3,6 +3,8 @@ package responses
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -52,6 +54,11 @@ type oaiToResponsesState struct {
 	// these are emitted as custom_tool_call items instead of function_call
 	CustomToolNames map[string]struct{}
 	FinishReason    string
+	// Codex compaction_trigger request: assistant text is buffered and emitted
+	// as a single compaction item instead of message/reasoning/function items.
+	Compaction     bool
+	CompactionText strings.Builder
+	CompactionItem []byte
 	// usage aggregation
 	PromptTokens     int64
 	CachedTokens     int64
@@ -63,6 +70,44 @@ type oaiToResponsesState struct {
 
 // responseIDCounter provides a process-wide unique counter for synthesized response identifiers.
 var responseIDCounter uint64
+
+func responsesCompactionItemID(responseID string) string {
+	if responseID != "" {
+		return "cmp_" + responseID
+	}
+	var buf [12]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("cmp_%x_%d", time.Now().UnixNano(), atomic.AddUint64(&responseIDCounter, 1))
+	}
+	return "cmp_" + hex.EncodeToString(buf[:])
+}
+
+// buildResponsesCompactionItem wraps the summarized text into the compaction
+// output item Codex expects (see the contract note in the request converter).
+func buildResponsesCompactionItem(responseID, summary string) []byte {
+	item := []byte(`{"id":"","type":"compaction","encrypted_content":"","status":"completed"}`)
+	item, _ = sjson.SetBytes(item, "id", responsesCompactionItemID(responseID))
+	item, _ = sjson.SetBytes(item, "encrypted_content", EncodeResponsesCompactionContent(summary))
+	return item
+}
+
+// chatCompletionMessageText flattens a Chat Completions message content
+// (string or text parts) into plain text.
+func chatCompletionMessageText(content gjson.Result) string {
+	if content.Type == gjson.String {
+		return content.String()
+	}
+	if !content.IsArray() {
+		return ""
+	}
+	var sb strings.Builder
+	for _, part := range content.Array() {
+		if part.Get("type").String() == "text" || part.Get("text").Exists() {
+			sb.WriteString(part.Get("text").String())
+		}
+	}
+	return sb.String()
+}
 
 func emitRespEvent(event string, payload []byte) []byte {
 	return translatorcommon.SSEEventData(event, payload)
@@ -230,6 +275,9 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 	outputs := make([][]byte, 0, len(outputItems))
 	for _, item := range outputItems {
 		outputs = append(outputs, item.raw)
+	}
+	if st.Compaction && len(st.CompactionItem) > 0 {
+		outputs = [][]byte{st.CompactionItem}
 	}
 	if len(outputs) > 0 {
 		completed, _ = sjson.SetRawBytes(completed, "response.output", translatorcommon.JoinRawArray(outputs))
@@ -421,6 +469,9 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.FuncArgsDone = make(map[string]bool)
 		st.FuncItemDone = make(map[string]bool)
 		st.CustomToolNames = responsesCustomToolNames(requestForNamespace)
+		st.Compaction = IsResponsesCompactionRequest(requestForNamespace)
+		st.CompactionText.Reset()
+		st.CompactionItem = nil
 		st.PromptTokens = 0
 		st.CachedTokens = 0
 		st.CompletionTokens = 0
@@ -452,6 +503,33 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		}
 		out = append(out, emitRespEvent("response.in_progress", inprog))
 		st.Started = true
+	}
+
+	if st.Compaction {
+		if isDone {
+			st.CompactionItem = buildResponsesCompactionItem(st.ResponseID, st.CompactionText.String())
+			added := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{}}`)
+			added, _ = sjson.SetBytes(added, "sequence_number", nextSeq())
+			added, _ = sjson.SetRawBytes(added, "item", st.CompactionItem)
+			out = append(out, emitRespEvent("response.output_item.added", added))
+			done := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{}}`)
+			done, _ = sjson.SetBytes(done, "sequence_number", nextSeq())
+			done, _ = sjson.SetRawBytes(done, "item", st.CompactionItem)
+			out = append(out, emitRespEvent("response.output_item.done", done))
+			// Always report completed: Codex needs the compaction item even
+			// when the upstream truncated the summary.
+			st.FinishReason = ""
+			st.CompletedEmitted = true
+			out = append(out, buildResponsesCompletedEvent(st, requestForNamespace, nextSeq))
+			return out
+		}
+		root.Get("choices").ForEach(func(_, choice gjson.Result) bool {
+			if c := choice.Get("delta.content"); c.Exists() {
+				st.CompactionText.WriteString(chatCompletionMessageText(c))
+			}
+			return true
+		})
+		return out
 	}
 
 	stopReasoning := func(text string) {
@@ -884,6 +962,14 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 		resp, _ = sjson.SetBytes(resp, "model", v.String())
 	}
 
+	if IsResponsesCompactionRequest(requestForNamespace) {
+		item := buildResponsesCompactionItem(id, chatCompletionMessageText(root.Get("choices.0.message.content")))
+		resp, _ = sjson.SetBytes(resp, "status", "completed")
+		resp, _ = sjson.SetRawBytes(resp, "incomplete_details", []byte("null"))
+		resp, _ = sjson.SetRawBytes(resp, "output", translatorcommon.JoinRawArray([][]byte{item}))
+		return setResponsesNonStreamUsage(resp, root)
+	}
+
 	// Build output list from choices[...]
 	var outputItems [][]byte
 	// Detect and capture reasoning content if present (with fallback to reasoning)
@@ -972,7 +1058,10 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 		resp, _ = sjson.SetRawBytes(resp, "output", translatorcommon.JoinRawArray(outputItems))
 	}
 
-	// usage mapping
+	return setResponsesNonStreamUsage(resp, root)
+}
+
+func setResponsesNonStreamUsage(resp []byte, root gjson.Result) []byte {
 	if usage := root.Get("usage"); usage.Exists() {
 		// Map common tokens
 		if usage.Get("prompt_tokens").Exists() || usage.Get("completion_tokens").Exists() || usage.Get("total_tokens").Exists() {
