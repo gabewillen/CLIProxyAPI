@@ -3672,86 +3672,193 @@ func TestXAIExecutorExecuteVideosUsesNativeEndpointFromRequestPath(t *testing.T)
 	}
 }
 
-func TestNormalizeXAITools_SimplifiesCodexAppAutomationUpdateSchema(t *testing.T) {
-	// Large oneOf+$ref schema mimicking Codex Desktop codex_app.automation_update.
-	params := `{"type":"object","oneOf":[{"properties":{"mode":{"type":"string"}}}],"$defs":{"a":{"type":"string"}},"x":"` + strings.Repeat("y", 1600) + `"}`
-	body := []byte(`{"model":"grok-4.5","tools":[{"type":"namespace","name":"codex_app","tools":[{"type":"function","name":"automation_update","description":"sched","strict":true,"parameters":` + params + `}]},{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`)
-	out := normalizeXAITools(body)
-
-	tools := gjson.GetBytes(out, "tools")
-	if !tools.IsArray() {
-		t.Fatalf("tools missing: %s", string(out))
+func TestNormalizeXAITools_MergesRefUnionRootIntoObject(t *testing.T) {
+	// Codex Desktop mcp__codex_app.automation_update: root oneOf of $ref
+	// branches that each resolve to an object in $defs.
+	params := `{"type":"object","properties":{},"oneOf":[{"$ref":"#/$defs/view"},{"$ref":"#/$defs/create"}],"$defs":{"view":{"type":"object","properties":{"id":{"type":"string"},"mode":{"type":"string","enum":["view"]}},"required":["mode","id"],"additionalProperties":false},"create":{"type":"object","properties":{"mode":{"type":"string","enum":["create"]},"prompt":{"$ref":"#/$defs/text"}},"required":["mode","prompt"]},"text":{"type":"string"}}}`
+	body := []byte(`{"model":"grok-4.6","tools":[{"type":"namespace","name":"mcp__codex_app","tools":[{"type":"function","name":"automation_update","strict":true,"parameters":` + params + `}]},{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`)
+	out, wrapped := normalizeXAIToolsTracked(body)
+	if len(wrapped) != 0 {
+		t.Fatalf("merged tool must not be tracked as wrapped: %v", wrapped)
 	}
-	foundAuto := false
-	foundExec := false
-	for _, tool := range tools.Array() {
-		switch tool.Get("name").String() {
-		case "codex_app__automation_update":
-			foundAuto = true
-			paramsRaw := tool.Get("parameters").Raw
-			if strings.Contains(paramsRaw, `"oneOf"`) || strings.Contains(paramsRaw, `"$defs"`) {
-				t.Fatalf("automation_update parameters were not simplified: %s", paramsRaw)
-			}
-			if tool.Get("parameters.type").String() != "object" {
-				t.Fatalf("automation_update parameters.type = %q, want object", tool.Get("parameters.type").String())
-			}
-			if tool.Get("parameters.additionalProperties").Type != gjson.True {
-				t.Fatalf("automation_update parameters should allow additionalProperties: %s", paramsRaw)
-			}
-			if tool.Get("strict").Type != gjson.False {
-				t.Fatalf("automation_update strict = %s, want false", tool.Get("strict").Raw)
-			}
-		case "exec_command":
-			foundExec = true
-			if got := tool.Get("parameters.properties.cmd.type").String(); got != "string" {
-				t.Fatalf("exec_command schema should be preserved, got %q in %s", got, tool.Raw)
-			}
+
+	tool := gjson.GetBytes(out, "tools.0")
+	if got := tool.Get("name").String(); got != "mcp__codex_app__automation_update" {
+		t.Fatalf("tools.0.name = %q; body=%s", got, string(out))
+	}
+	params0 := tool.Get("parameters")
+	for _, key := range []string{"oneOf", "anyOf", "allOf", "required"} {
+		if params0.Get(key).Exists() {
+			t.Fatalf("merged parameters still carry %s: %s", key, params0.Raw)
 		}
 	}
-	if !foundAuto {
-		t.Fatalf("automation_update tool missing after normalize: %s", string(out))
+	if params0.Get("type").String() != "object" {
+		t.Fatalf("merged parameters.type = %q", params0.Get("type").String())
 	}
-	if !foundExec {
-		t.Fatalf("exec_command tool missing after normalize: %s", string(out))
+	for _, prop := range []string{"id", "mode", "prompt"} {
+		if !params0.Get("properties." + prop).Exists() {
+			t.Fatalf("merged properties missing %s: %s", prop, params0.Raw)
+		}
+	}
+	if !params0.Get("$defs.text").Exists() {
+		t.Fatalf("$defs dropped from merged parameters: %s", params0.Raw)
+	}
+	if tool.Get("strict").Type != gjson.False {
+		t.Fatalf("strict should be false after merge: %s", tool.Raw)
+	}
+	if got := gjson.GetBytes(out, "tools.1.parameters.properties.cmd.type").String(); got != "string" {
+		t.Fatalf("exec_command schema changed: %s", string(out))
 	}
 }
 
-func TestNormalizeXAITools_SimplifiesFlattenedAndInvalidRootSchemas(t *testing.T) {
-	body := []byte(`{"tools":[{"type":"function","name":"codex_app__automation_update","strict":true,"parameters":{"oneOf":[{"type":"object","properties":{"action":{"type":"string"}},"required":["action"]},{"type":"null"}]}},{"type":"function","name":"nullable_lookup","strict":true,"parameters":{"anyOf":[{"type":"object","properties":{"query":{"type":"string"}}},{"type":["object","null"]}]}},{"type":"custom","name":"nullable_custom","strict":true,"parameters":{"oneOf":[{"type":"object"},{"type":"null"}]}},{"type":"function","name":"mixed_nullable","strict":true,"parameters":{"type":"object","oneOf":[{"required":["query"]},{"type":"null"}],"properties":{"query":{"type":"string"}}}},{"type":"function","name":"array_root_union","strict":true,"parameters":{"type":["object"],"anyOf":[{"required":["query"]},{"required":["id"]}],"properties":{"query":{"type":"string"},"id":{"type":"integer"}}}},{"type":"function","name":"echo_tool","strict":true,"parameters":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}}]}`)
-	out := normalizeXAITools(body)
+func TestNormalizeXAITools_WrapsNonObjectRootSchemas(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","name":"nullable_lookup","strict":true,"parameters":{"anyOf":[{"type":"object","properties":{"a":{"type":"string"}}},{"type":"string"}]}},{"type":"custom","name":"nullable_custom","strict":true,"parameters":{"oneOf":[{"type":"object"},{"type":"null"}]}},{"type":"function","name":"string_root","parameters":{"type":"string"}},{"type":"function","name":"echo_tool","strict":true,"parameters":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}}]}`)
+	out, wrapped := normalizeXAIToolsTracked(body)
 
 	tools := gjson.GetBytes(out, "tools").Array()
-	if len(tools) != 6 {
-		t.Fatalf("tools length = %d, want 6; body=%s", len(tools), string(out))
+	if len(tools) != 4 {
+		t.Fatalf("tools length = %d, want 4; body=%s", len(tools), string(out))
 	}
-	for index, wantName := range []string{"codex_app__automation_update", "nullable_lookup", "nullable_custom", "mixed_nullable", "array_root_union"} {
+	for index, wantName := range []string{"nullable_lookup", "nullable_custom", "string_root"} {
 		tool := tools[index]
 		if got := tool.Get("name").String(); got != wantName {
-			t.Fatalf("tools.%d.name = %q, want %q; body=%s", index, got, wantName, string(out))
+			t.Fatalf("tools.%d.name = %q, want %q", index, got, wantName)
 		}
-		if got := tool.Get("type").String(); got != xaiFunctionToolType {
-			t.Fatalf("tools.%d type = %q, want function; body=%s", index, got, string(out))
+		if _, ok := wrapped[wantName]; !ok {
+			t.Fatalf("%s not tracked as wrapped: %v", wantName, wrapped)
 		}
 		if got := tool.Get("parameters.type").String(); got != "object" {
-			t.Fatalf("tools.%d parameters.type = %q, want object; body=%s", index, got, string(out))
+			t.Fatalf("tools.%d parameters.type = %q; body=%s", index, got, string(out))
 		}
-		if tool.Get("parameters.additionalProperties").Type != gjson.True {
-			t.Fatalf("tools.%d parameters should allow additionalProperties: %s", index, string(out))
+		if !tool.Get("parameters.properties.input").Exists() {
+			t.Fatalf("tools.%d parameters not wrapped under input: %s", index, tool.Raw)
 		}
-		if tool.Get("strict").Type != gjson.False {
-			t.Fatalf("tools.%d strict = %s, want false; body=%s", index, tool.Get("strict").Raw, string(out))
+		if got := tool.Get("parameters.required.0").String(); got != "input" {
+			t.Fatalf("tools.%d required = %s", index, tool.Get("parameters.required").Raw)
+		}
+		if strict := tool.Get("strict"); strict.Exists() && strict.Type != gjson.False {
+			t.Fatalf("tools.%d strict = %s, want false", index, strict.Raw)
 		}
 	}
+	if got := gjson.GetBytes(out, "tools.0.parameters.properties.input.anyOf.1.type").String(); got != "string" {
+		t.Fatalf("original union not preserved under input: %s", string(out))
+	}
 
-	echoTool := tools[5]
+	echoTool := tools[3]
+	if _, ok := wrapped["echo_tool"]; ok {
+		t.Fatal("plain object tool must not be wrapped")
+	}
 	if got := echoTool.Get("parameters.properties.message.type").String(); got != "string" {
-		t.Fatalf("echo_tool schema changed, message type = %q; body=%s", got, string(out))
+		t.Fatalf("echo_tool schema changed: %s", string(out))
 	}
 	if echoTool.Get("strict").Type != gjson.True {
 		t.Fatalf("echo_tool strict changed: %s", string(out))
 	}
 	if echoTool.Get("parameters.additionalProperties").Type != gjson.False {
 		t.Fatalf("echo_tool additionalProperties changed: %s", string(out))
+	}
+}
+
+func TestNormalizeXAIFunctionParameters(t *testing.T) {
+	tests := []struct {
+		name     string
+		in       string
+		wantMode xaiParametersMode
+		check    func(t *testing.T, out gjson.Result)
+	}{
+		{
+			name:     "plain object untouched",
+			in:       `{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}`,
+			wantMode: xaiParametersUnchanged,
+		},
+		{
+			name:     "root anyOf with string branch wrapped",
+			in:       `{"anyOf":[{"type":"object","properties":{"a":{"type":"string"}}},{"type":"string"}]}`,
+			wantMode: xaiParametersWrapped,
+			check: func(t *testing.T, out gjson.Result) {
+				if out.Get("properties.input.anyOf.#").Int() != 2 || out.Get("required.0").String() != "input" {
+					t.Fatalf("unexpected wrap: %s", out.Raw)
+				}
+			},
+		},
+		{
+			name:     "all-object ref union merged",
+			in:       `{"oneOf":[{"$ref":"#/$defs/a"},{"$ref":"#/$defs/b"}],"$defs":{"a":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]},"b":{"type":"object","properties":{"y":{"type":"integer"}},"required":["y"]}}}`,
+			wantMode: xaiParametersMerged,
+			check: func(t *testing.T, out gjson.Result) {
+				if out.Get("oneOf").Exists() || out.Get("required").Exists() {
+					t.Fatalf("union or required survived merge: %s", out.Raw)
+				}
+				if !out.Get("properties.x").Exists() || !out.Get("properties.y").Exists() {
+					t.Fatalf("merged properties incomplete: %s", out.Raw)
+				}
+			},
+		},
+		{
+			name:     "inline object branches keep constraints and gain types",
+			in:       `{"type":"object","oneOf":[{"required":["radius"]},{"required":["size"]}],"properties":{"radius":{"type":"number"},"size":{"type":"object"}}}`,
+			wantMode: xaiParametersTyped,
+			check: func(t *testing.T, out gjson.Result) {
+				if out.Get("oneOf.0.type").String() != "object" || out.Get("oneOf.1.required.0").String() != "size" {
+					t.Fatalf("inline branches changed unexpectedly: %s", out.Raw)
+				}
+			},
+		},
+		{
+			name:     "ref to non-object branch wrapped",
+			in:       `{"oneOf":[{"$ref":"#/$defs/a"},{"$ref":"#/$defs/s"}],"$defs":{"a":{"type":"object"},"s":{"type":"string"}}}`,
+			wantMode: xaiParametersWrapped,
+		},
+		{
+			name:     "scalar root wrapped",
+			in:       `{"type":"string"}`,
+			wantMode: xaiParametersWrapped,
+		},
+		{
+			name:     "missing type with properties typed",
+			in:       `{"properties":{"a":{"type":"string"}}}`,
+			wantMode: xaiParametersTyped,
+		},
+		{
+			name:     "empty parameters typed",
+			in:       ``,
+			wantMode: xaiParametersTyped,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, mode, ok := normalizeXAIFunctionParameters([]byte(tt.in))
+			if !ok {
+				t.Fatal("normalize failed")
+			}
+			if mode != tt.wantMode {
+				t.Fatalf("mode = %d, want %d; out=%s", mode, tt.wantMode, string(out))
+			}
+			parsed := gjson.ParseBytes(out)
+			if parsed.Get("type").String() != "object" {
+				t.Fatalf("root type = %q; out=%s", parsed.Get("type").String(), string(out))
+			}
+			if tt.check != nil {
+				tt.check(t, parsed)
+			}
+		})
+	}
+}
+
+func TestUnwrapXAIWrappedToolCallArguments(t *testing.T) {
+	wrapped := map[string]struct{}{"nullable_lookup": {}}
+	item := []byte(`{"type":"response.output_item.done","item":{"type":"function_call","name":"nullable_lookup","call_id":"c1","arguments":"{\"input\":{\"a\":\"x\"}}"}}`)
+	out := unwrapXAIWrappedToolCallArguments(item, wrapped)
+	if got := gjson.GetBytes(out, "item.arguments").String(); got != `{"a":"x"}` {
+		t.Fatalf("item arguments = %q", got)
+	}
+	completed := []byte(`{"type":"response.completed","response":{"output":[{"type":"function_call","name":"nullable_lookup","arguments":"{\"input\":\"plain\"}"},{"type":"function_call","name":"other","arguments":"{\"input\":1}"}]}}`)
+	out = unwrapXAIWrappedToolCallArguments(completed, wrapped)
+	if got := gjson.GetBytes(out, "response.output.0.arguments").String(); got != `"plain"` {
+		t.Fatalf("output.0 arguments = %q", got)
+	}
+	if got := gjson.GetBytes(out, "response.output.1.arguments").String(); got != `{"input":1}` {
+		t.Fatalf("unwrapped tool must be untouched, got %q", got)
 	}
 }
 
@@ -4043,55 +4150,6 @@ func TestNormalizeXAITools_PreservesUnrelatedSchemas(t *testing.T) {
 				t.Fatalf("additionalProperties changed: %s", string(out))
 			}
 		})
-	}
-}
-
-func TestXAIFunctionParametersNeedSimplification(t *testing.T) {
-	auto := gjson.Parse(`{"type":"function","name":"automation_update","parameters":{"type":"object"}}`)
-	if !xaiFunctionParametersNeedSimplification(auto, "codex_app") {
-		t.Fatal("codex_app.automation_update should need simplification")
-	}
-	if xaiFunctionParametersNeedSimplification(auto, "calendar") {
-		t.Fatal("automation_update outside codex_app should not need simplification")
-	}
-	if xaiFunctionParametersNeedSimplification(auto, "") {
-		t.Fatal("top-level automation_update should not need simplification")
-	}
-	flattened := gjson.Parse(`{"type":"function","name":"codex_app__automation_update","parameters":{"type":"object"}}`)
-	if !xaiFunctionParametersNeedSimplification(flattened, "") {
-		t.Fatal("flattened codex_app__automation_update should need simplification")
-	}
-	custom := gjson.Parse(`{"type":"custom","name":"automation_update","parameters":{"type":"object"}}`)
-	if xaiFunctionParametersNeedSimplification(custom, "codex_app") {
-		t.Fatal("custom codex_app.automation_update with an object schema should not need simplification")
-	}
-	invalidCustom := gjson.Parse(`{"type":"custom","name":"nullable_lookup","parameters":{"oneOf":[{"type":"object"},{"type":"null"}]}}`)
-	if !xaiFunctionParametersNeedSimplification(invalidCustom, "") {
-		t.Fatal("custom tool normalized to a function should simplify an invalid root union")
-	}
-	invalidOneOf := gjson.Parse(`{"type":"function","name":"nullable_lookup","parameters":{"oneOf":[{"type":"object"},{"type":"null"}]}}`)
-	if !xaiFunctionParametersNeedSimplification(invalidOneOf, "") {
-		t.Fatal("root oneOf with a non-object branch should need simplification")
-	}
-	invalidAnyOf := gjson.Parse(`{"type":"function","name":"nullable_lookup","parameters":{"anyOf":[{"type":"object"},{"type":["object","null"]}]}}`)
-	if !xaiFunctionParametersNeedSimplification(invalidAnyOf, "") {
-		t.Fatal("root anyOf with a non-object type should need simplification")
-	}
-	untypedBranch := gjson.Parse(`{"type":"function","name":"nullable_lookup","parameters":{"oneOf":[{"type":"object"},{"const":null}]}}`)
-	if !xaiFunctionParametersNeedSimplification(untypedBranch, "") {
-		t.Fatal("root union with an untyped branch should need simplification")
-	}
-	objectUnion := gjson.Parse(`{"type":"function","name":"lookup","parameters":{"oneOf":[{"type":"object"},{"type":"object"}]}}`)
-	if xaiFunctionParametersNeedSimplification(objectUnion, "") {
-		t.Fatal("root union containing only object branches should not need simplification")
-	}
-	nestedUnion := gjson.Parse(`{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"value":{"oneOf":[{"type":"string"},{"type":"null"}]}}}}`)
-	if xaiFunctionParametersNeedSimplification(nestedUnion, "") {
-		t.Fatal("nested union should not need root schema simplification")
-	}
-	safe := gjson.Parse(`{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}`)
-	if xaiFunctionParametersNeedSimplification(safe, "codex_app") {
-		t.Fatal("unrelated codex_app function should not need simplification")
 	}
 }
 

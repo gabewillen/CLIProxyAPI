@@ -18,22 +18,15 @@ var (
 )
 
 const (
-	xaiImageHandlerType        = "openai-image"
-	xaiVideoHandlerType        = "openai-video"
-	xaiCustomToolType          = "custom"
-	xaiFunctionToolType        = "function"
-	xaiImageGenerationToolType = "image_generation"
-	xaiNamespaceToolType       = "namespace"
-	xaiToolSearchType          = "tool_search"
-	xaiWebSearchToolType       = "web_search"
-	xaiXSearchToolType         = "x_search"
-	// Codex Desktop injects codex_app.automation_update with a large oneOf+$ref
-	// schema. xAI's free/build Responses path accepts the HTTP request but never
-	// emits SSE when that schema is present, so Desktop hangs on "thinking".
-	xaiCodexAppNamespaceName    = "codex_app"
-	xaiAutomationUpdateToolName = "automation_update"
-	// Permissive placeholder schema: keeps the tool callable without the hang.
-	xaiSafeFunctionParameters   = `{"type":"object","properties":{},"additionalProperties":true}`
+	xaiImageHandlerType         = "openai-image"
+	xaiVideoHandlerType         = "openai-video"
+	xaiCustomToolType           = "custom"
+	xaiFunctionToolType         = "function"
+	xaiImageGenerationToolType  = "image_generation"
+	xaiNamespaceToolType        = "namespace"
+	xaiToolSearchType           = "tool_search"
+	xaiWebSearchToolType        = "web_search"
+	xaiXSearchToolType          = "x_search"
 	xaiImagesGenerationsPath    = "/images/generations"
 	xaiImagesEditsPath          = "/images/edits"
 	xaiDefaultImageEndpointPath = xaiImagesGenerationsPath

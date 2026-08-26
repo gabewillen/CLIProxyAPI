@@ -31,6 +31,7 @@ type xaiPreparedRequest struct {
 	body                  []byte
 	namespaceTools        map[string]xaiNamespaceToolRef
 	clientDeclaredTools   map[xaiClientToolKey]struct{}
+	wrappedTools          map[string]struct{}
 	sessionID             string
 	replayScope           xaiReasoningReplayScope
 	filterInternalXSearch bool
@@ -92,7 +93,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	// Collect before normalizeXAITools flattens namespace wrappers so keys match
 	// the post-restore (namespace, short-name) shape used by the response filter.
 	clientDeclaredTools := collectXAIClientDeclaredToolKeys(body)
-	body = normalizeXAITools(body)
+	body, wrappedTools := normalizeXAIToolsTracked(body)
 	body = promoteXAIAdditionalTools(body)
 	// Drop choices that point at tools removed by normalizeXAITools before any
 	// configured x_search injection, so no surviving choice references a deleted tool.
@@ -139,6 +140,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 		body:                  body,
 		namespaceTools:        namespaceTools,
 		clientDeclaredTools:   clientDeclaredTools,
+		wrappedTools:          wrappedTools,
 		sessionID:             sessionID,
 		replayScope:           replayScope,
 		filterInternalXSearch: xaiRequestHasNativeXSearch(body),
@@ -926,8 +928,16 @@ func xaiToolChoiceMatchesAvailable(choice gjson.Result, available map[xaiToolCho
 }
 
 func normalizeXAITools(body []byte) []byte {
+	body, _ = normalizeXAIToolsTracked(body)
+	return body
+}
+
+// normalizeXAIToolsTracked also returns the upstream names of function tools
+// whose parameters were wrapped under "input" so responses can be unwrapped.
+func normalizeXAIToolsTracked(body []byte) ([]byte, map[string]struct{}) {
+	wrapped := make(map[string]struct{})
 	if !gjson.ValidBytes(body) {
-		return body
+		return body, wrapped
 	}
 	keepImageGeneration := xaiSupportsNativeImageGeneration(gjson.GetBytes(body, "model").String())
 	original := body
@@ -936,7 +946,7 @@ func normalizeXAITools(body []byte) []byte {
 		if !tools.Exists() || !tools.IsArray() {
 			return true
 		}
-		filtered, changed, ok := normalizeXAIToolArray(tools, keepImageGeneration)
+		filtered, changed, ok := normalizeXAIToolArray(tools, keepImageGeneration, wrapped)
 		if !ok {
 			return false
 		}
@@ -952,7 +962,7 @@ func normalizeXAITools(body []byte) []byte {
 	}
 
 	if !normalizeAtPath("tools") {
-		return original
+		return original, wrapped
 	}
 	input := gjson.GetBytes(body, "input")
 	if input.Exists() && input.IsArray() {
@@ -961,11 +971,11 @@ func normalizeXAITools(body []byte) []byte {
 				continue
 			}
 			if !normalizeAtPath(fmt.Sprintf("input.%d.tools", index)) {
-				return original
+				return original, wrapped
 			}
 		}
 	}
-	return body
+	return body, wrapped
 }
 
 // promoteXAIAdditionalTools moves Responses Lite tool declarations to the
@@ -1026,7 +1036,7 @@ func promoteXAIAdditionalTools(body []byte) []byte {
 	return updated
 }
 
-func normalizeXAIToolArray(tools gjson.Result, keepImageGeneration bool) ([]byte, bool, bool) {
+func normalizeXAIToolArray(tools gjson.Result, keepImageGeneration bool, wrapped map[string]struct{}) ([]byte, bool, bool) {
 	toolItems := tools.Array()
 	filtered := make([][]byte, 0, len(toolItems))
 	changed := false
@@ -1037,7 +1047,7 @@ func normalizeXAIToolArray(tools gjson.Result, keepImageGeneration bool) ([]byte
 			namespaceName := tool.Get("name").String()
 			if namespaceTools := tool.Get("tools"); namespaceTools.IsArray() {
 				for _, nestedTool := range namespaceTools.Array() {
-					nestedRaw, nestedChanged, ok := normalizeXAITool(nestedTool, namespaceName, keepImageGeneration)
+					nestedRaw, nestedChanged, ok := normalizeXAITool(nestedTool, namespaceName, keepImageGeneration, wrapped)
 					if !ok {
 						return nil, false, false
 					}
@@ -1049,7 +1059,7 @@ func normalizeXAIToolArray(tools gjson.Result, keepImageGeneration bool) ([]byte
 			}
 			continue
 		}
-		raw, toolChanged, ok := normalizeXAITool(tool, "", keepImageGeneration)
+		raw, toolChanged, ok := normalizeXAITool(tool, "", keepImageGeneration, wrapped)
 		if !ok {
 			return nil, false, false
 		}
@@ -1143,7 +1153,7 @@ func normalizeXAINamespaceToolChoice(body []byte) []byte {
 	return body
 }
 
-func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageGeneration bool) ([]byte, bool, bool) {
+func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageGeneration bool, wrapped map[string]struct{}) ([]byte, bool, bool) {
 	toolType := tool.Get("type").String()
 	changed := false
 	if toolType == xaiToolSearchType {
@@ -1157,19 +1167,6 @@ func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageGenerati
 	}
 
 	raw := []byte(tool.Raw)
-	schemaTool := tool
-	if toolType == xaiFunctionToolType || toolType == xaiCustomToolType {
-		updatedTool, schemaChanged, ok := normalizeXAIObjectRootUnionBranchTypes(raw)
-		if !ok {
-			return nil, false, false
-		}
-		raw = updatedTool
-		if schemaChanged {
-			schemaTool = gjson.ParseBytes(raw)
-			changed = true
-			log.Debugf("xai: added object types to root union branches for tool %s.%s", namespaceName, tool.Get("name").String())
-		}
-	}
 	if toolType == xaiCustomToolType {
 		updatedTool, errSet := sjson.SetBytes(raw, "type", xaiFunctionToolType)
 		if errSet != nil {
@@ -1187,34 +1184,9 @@ func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageGenerati
 		raw = updatedTool
 		changed = true
 	}
-	if toolType == xaiFunctionToolType && !schemaTool.Get("parameters").Exists() {
-		updatedTool, errSet := sjson.SetRawBytes(raw, "parameters", []byte(`{"type":"object","properties":{}}`))
-		if errSet != nil {
-			return nil, false, false
-		}
-		raw = updatedTool
-		changed = true
-	}
-	// Simplify the Codex Desktop automation schema and root unions that xAI
-	// rejects because function parameters must resolve exclusively to objects.
-	if toolType == xaiFunctionToolType && xaiFunctionParametersNeedSimplification(schemaTool, namespaceName) {
-		updatedTool, errSet := sjson.SetRawBytes(raw, "parameters", []byte(xaiSafeFunctionParameters))
-		if errSet != nil {
-			return nil, false, false
-		}
-		raw = updatedTool
-		if strict := tool.Get("strict"); strict.Exists() && strict.Bool() {
-			updatedTool, errSet = sjson.SetBytes(raw, "strict", false)
-			if errSet != nil {
-				return nil, false, false
-			}
-			raw = updatedTool
-		}
-		changed = true
-		log.Debugf("xai: simplified parameters for tool %s.%s to avoid upstream schema rejection or hang", namespaceName, tool.Get("name").String())
-	}
+	qualifiedName := tool.Get("name").String()
 	if toolType == xaiFunctionToolType && strings.TrimSpace(namespaceName) != "" {
-		qualifiedName := qualifyXAINamespaceToolName(namespaceName, tool.Get("name").String())
+		qualifiedName = qualifyXAINamespaceToolName(namespaceName, tool.Get("name").String())
 		if qualifiedName == "" {
 			return nil, false, false
 		}
@@ -1224,6 +1196,33 @@ func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageGenerati
 		}
 		raw = updatedTool
 		changed = true
+	}
+	if toolType == xaiFunctionToolType {
+		parameters, mode, ok := normalizeXAIFunctionParameters([]byte(tool.Get("parameters").Raw))
+		if !ok {
+			return nil, false, false
+		}
+		if mode != xaiParametersUnchanged {
+			updatedTool, errSet := sjson.SetRawBytes(raw, "parameters", parameters)
+			if errSet != nil {
+				return nil, false, false
+			}
+			raw = updatedTool
+			changed = true
+			log.Debugf("xai: normalized parameters for tool %s (mode=%d) to satisfy upstream object-root schema validation", qualifiedName, mode)
+		}
+		if mode == xaiParametersMerged || mode == xaiParametersWrapped {
+			if strict := tool.Get("strict"); strict.Exists() && strict.Bool() {
+				updatedTool, errSet := sjson.SetBytes(raw, "strict", false)
+				if errSet != nil {
+					return nil, false, false
+				}
+				raw = updatedTool
+			}
+		}
+		if mode == xaiParametersWrapped && wrapped != nil {
+			wrapped[qualifiedName] = struct{}{}
+		}
 	}
 	return raw, changed, true
 }
