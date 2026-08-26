@@ -39,7 +39,7 @@ type Store struct {
 // New creates a store; the disk cache is read lazily on first use.
 func New(opts Options) *Store {
 	return &Store{
-		opts:     opts.withDefaults(),
+		opts:     opts.Normalized(),
 		accounts: make(map[string]*AccountCatalog),
 		lastTry:  make(map[string]time.Time),
 	}

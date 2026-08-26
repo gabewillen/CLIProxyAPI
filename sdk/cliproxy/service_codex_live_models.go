@@ -60,7 +60,7 @@ func (s *Service) codexLiveStore() *codexmodels.Store {
 	}
 	s.codexLiveMu.Lock()
 	defer s.codexLiveMu.Unlock()
-	if s.codexLive == nil || !sameCodexLiveModelsOptions(s.codexLive.Options(), opts) {
+	if s.codexLive == nil || !sameCodexLiveModelsOptions(s.codexLive.Options(), opts.Normalized()) {
 		s.codexLive = codexmodels.New(opts)
 	}
 	return s.codexLive

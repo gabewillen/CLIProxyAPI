@@ -26,6 +26,19 @@ func TestCodexLiveModelsOptions(t *testing.T) {
 	}
 }
 
+func TestCodexLiveStoreSurvivesConfigReload(t *testing.T) {
+	s := &Service{cfg: &config.Config{}}
+	first := s.codexLiveStore()
+	s.cfg = &config.Config{}
+	if s.codexLiveStore() != first {
+		t.Fatal("store must be reused when options are unchanged")
+	}
+	s.cfg = &config.Config{CodexLiveModelsRefresh: "1h"}
+	if s.codexLiveStore() == first {
+		t.Fatal("store must be rebuilt when options change")
+	}
+}
+
 func TestApplyCodexLiveModelsDisabledKeepsStatic(t *testing.T) {
 	off := false
 	s := &Service{cfg: &config.Config{CodexLiveModels: &off}}

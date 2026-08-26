@@ -47,7 +47,8 @@ type Options struct {
 	Originator    string
 }
 
-func (o Options) withDefaults() Options {
+// Normalized returns o with defaults filled in.
+func (o Options) Normalized() Options {
 	if o.Refresh <= 0 {
 		o.Refresh = DefaultRefresh
 	}
@@ -112,7 +113,7 @@ func Visibility(entry Entry) string {
 
 // Fetch downloads the live catalog for one account.
 func Fetch(ctx context.Context, opts Options, creds Credentials) ([]Entry, error) {
-	opts = opts.withDefaults()
+	opts = opts.Normalized()
 	if strings.TrimSpace(creds.AccessToken) == "" {
 		return nil, fmt.Errorf("missing access token")
 	}
