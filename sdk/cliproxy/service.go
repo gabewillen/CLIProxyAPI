@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexmodels"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/modellimits"
@@ -37,6 +38,11 @@ type Service struct {
 	modelLimits       *modellimits.Resolver
 	modelLimitsLogged map[string]string
 	modelLimitsMu     sync.Mutex
+
+	// codexLive caches live Codex catalogs per account; guarded by codexLiveMu.
+	codexLive       *codexmodels.Store
+	codexLiveLogged map[string]string
+	codexLiveMu     sync.Mutex
 
 	// configUpdateMu serializes config updates across watcher + home.
 	configUpdateMu sync.Mutex

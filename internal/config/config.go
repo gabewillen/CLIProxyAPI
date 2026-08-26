@@ -87,6 +87,13 @@ type Config struct {
 	// ModelsDevRefresh is how often the models.dev catalog is re-fetched (duration string, default 24h).
 	ModelsDevRefresh string `yaml:"models-dev-refresh,omitempty" json:"models-dev-refresh,omitempty"`
 
+	// CodexLiveModels enables fetching each Codex OAuth account's live model
+	// catalog from chatgpt.com and merging it with the static Codex models. Default true.
+	CodexLiveModels *bool `yaml:"codex-live-models,omitempty" json:"codex-live-models,omitempty"`
+
+	// CodexLiveModelsRefresh is how often each account's live catalog is re-fetched (duration string, default 6h).
+	CodexLiveModelsRefresh string `yaml:"codex-live-models-refresh,omitempty" json:"codex-live-models-refresh,omitempty"`
+
 	// RequestRetry defines the number of additional credential retry rounds after
 	// the first round has exhausted its eligible credentials.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
@@ -182,6 +189,14 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+// CodexLiveModelsEnabled reports whether live Codex catalog fetching is on.
+func (c *Config) CodexLiveModelsEnabled() bool {
+	if c == nil || c.CodexLiveModels == nil {
+		return true
+	}
+	return *c.CodexLiveModels
 }
 
 // AutoModelLimitsEnabled reports whether automatic model limit discovery is on.

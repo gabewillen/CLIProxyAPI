@@ -146,10 +146,39 @@ func applyCodexClientNonTemplatePriorities(result []map[string]any, templates ma
 
 func loadCodexClientModelTemplates() (map[string]map[string]any, map[string]any, error) {
 	raw, revision := registry.GetCodexClientModelsSnapshot()
-	return loadCodexClientModelTemplatesSnapshot(raw, revision)
+	live, liveRevision := registry.GetCodexLiveClientModelsSnapshot()
+	return loadCodexClientModelTemplatesSnapshotWithLive(raw, revision, live, liveRevision)
 }
 
 func loadCodexClientModelTemplatesSnapshot(raw []byte, revision uint64) (map[string]map[string]any, map[string]any, error) {
+	return loadCodexClientModelTemplatesSnapshotWithLive(raw, revision, nil, 0)
+}
+
+// codexLiveTemplateFields are refreshed on a static template from the live catalog.
+var codexLiveTemplateFields = []string{
+	"display_name", "description", "visibility", "context_window", "max_context_window",
+	"priority", "supported_reasoning_levels", "default_reasoning_level",
+}
+
+// applyCodexLiveTemplates overlays live catalog entries: unknown slugs become
+// full templates, known slugs get their live metadata fields refreshed.
+func applyCodexLiveTemplates(templates map[string]map[string]any, live map[string]map[string]any) {
+	for slug, entry := range live {
+		template, ok := templates[slug]
+		if !ok {
+			templates[slug] = cloneCodexClientModelMap(entry)
+			continue
+		}
+		for _, field := range codexLiveTemplateFields {
+			if value, exists := entry[field]; exists && value != nil {
+				template[field] = cloneCodexClientModelValue(value)
+			}
+		}
+	}
+}
+
+func loadCodexClientModelTemplatesSnapshotWithLive(raw []byte, revision uint64, live map[string]map[string]any, liveRevision uint64) (map[string]map[string]any, map[string]any, error) {
+	revision = revision<<32 ^ liveRevision
 	codexClientModelTemplatesMu.Lock()
 	defer codexClientModelTemplatesMu.Unlock()
 	if codexClientModelTemplatesLoaded && codexClientModelTemplatesRevision == revision {
@@ -172,6 +201,7 @@ func loadCodexClientModelTemplatesSnapshot(raw []byte, revision uint64) (map[str
 				defaultTemplate = cloneCodexClientModelMap(model)
 			}
 		}
+		applyCodexLiveTemplates(templates, live)
 	}
 
 	codexClientModelTemplatesLoaded = true
