@@ -67,31 +67,40 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	// Get all available models
 	allModels := h.Models()
 
-	// Filter to only include the 4 required fields: id, object, created, owned_by
+	c.JSON(http.StatusOK, gin.H{
+		"object": "list",
+		"data":   filterOpenAIModelsList(allModels, h.Cfg.OpenAIModelsExtendedFieldsEnabled()),
+	})
+}
+
+// openAIModelsExtendedFields are passed through by GET /v1/models when
+// openai-models-extended-fields is enabled (fork divergence from upstream,
+// which strips everything but id/object/created/owned_by).
+var openAIModelsExtendedFields = []string{"context_length", "max_context_length", "max_completion_tokens"}
+
+func filterOpenAIModelsList(allModels []map[string]any, extended bool) []map[string]any {
 	filteredModels := make([]map[string]any, len(allModels))
 	for i, model := range allModels {
 		filteredModel := map[string]any{
 			"id":     model["id"],
 			"object": model["object"],
 		}
-
-		// Add created field if it exists
 		if created, exists := model["created"]; exists {
 			filteredModel["created"] = created
 		}
-
-		// Add owned_by field if it exists
 		if ownedBy, exists := model["owned_by"]; exists {
 			filteredModel["owned_by"] = ownedBy
 		}
-
+		if extended {
+			for _, key := range openAIModelsExtendedFields {
+				if value, exists := model[key]; exists {
+					filteredModel[key] = value
+				}
+			}
+		}
 		filteredModels[i] = filteredModel
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   filteredModels,
-	})
+	return filteredModels
 }
 
 // ChatCompletions handles the /v1/chat/completions endpoint.

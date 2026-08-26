@@ -61,6 +61,19 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+
+	// OpenAIModelsExtendedFields lets GET /v1/models pass through context_length,
+	// max_context_length and max_completion_tokens when known. Default true.
+	// False restores the strict id/object/created/owned_by shape.
+	OpenAIModelsExtendedFields *bool `yaml:"openai-models-extended-fields,omitempty" json:"openai-models-extended-fields,omitempty"`
+}
+
+// OpenAIModelsExtendedFieldsEnabled reports whether GET /v1/models may carry limit fields.
+func (c *SDKConfig) OpenAIModelsExtendedFieldsEnabled() bool {
+	if c == nil || c.OpenAIModelsExtendedFields == nil {
+		return true
+	}
+	return *c.OpenAIModelsExtendedFields
 }
 
 // ClaudeCodeConfig configures Claude Code compatibility behavior.

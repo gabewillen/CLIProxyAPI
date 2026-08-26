@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modellimits"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/wsrelay"
@@ -31,6 +32,11 @@ type Service struct {
 
 	// cfgMu protects concurrent access to the configuration.
 	cfgMu sync.RWMutex
+
+	// modelLimits resolves compat model context/output limits; guarded by modelLimitsMu.
+	modelLimits       *modellimits.Resolver
+	modelLimitsLogged map[string]string
+	modelLimitsMu     sync.Mutex
 
 	// configUpdateMu serializes config updates across watcher + home.
 	configUpdateMu sync.Mutex

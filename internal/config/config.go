@@ -76,6 +76,17 @@ type Config struct {
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
 
+	// AutoModelLimits enables automatic context/output limit discovery for
+	// openai-compatibility models without an explicit max-context-length
+	// (upstream GET /models first, then models.dev). Default true.
+	AutoModelLimits *bool `yaml:"auto-model-limits,omitempty" json:"auto-model-limits,omitempty"`
+
+	// ModelsDevURL overrides the models.dev catalog URL used by AutoModelLimits.
+	ModelsDevURL string `yaml:"models-dev-url,omitempty" json:"models-dev-url,omitempty"`
+
+	// ModelsDevRefresh is how often the models.dev catalog is re-fetched (duration string, default 24h).
+	ModelsDevRefresh string `yaml:"models-dev-refresh,omitempty" json:"models-dev-refresh,omitempty"`
+
 	// RequestRetry defines the number of additional credential retry rounds after
 	// the first round has exhausted its eligible credentials.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
@@ -171,4 +182,12 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+// AutoModelLimitsEnabled reports whether automatic model limit discovery is on.
+func (c *Config) AutoModelLimitsEnabled() bool {
+	if c == nil || c.AutoModelLimits == nil {
+		return true
+	}
+	return *c.AutoModelLimits
 }

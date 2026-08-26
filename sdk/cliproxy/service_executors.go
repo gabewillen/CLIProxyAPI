@@ -39,6 +39,7 @@ func (s *Service) newOpenAICompatibilityRegistrationCache() *openAICompatibility
 		return nil
 	}
 
+	s.prefetchModelLimits(cfg)
 	cache := &openAICompatibilityRegistrationCache{
 		byName:  make(map[string]*openAICompatibilityRegistrationEntry, len(cfg.OpenAICompatibility)),
 		byIndex: make(map[int]*openAICompatibilityRegistrationEntry, len(cfg.OpenAICompatibility)),
@@ -56,7 +57,7 @@ func (s *Service) newOpenAICompatibilityRegistrationCache() *openAICompatibility
 		}
 		entry := &openAICompatibilityRegistrationEntry{
 			providerKey: util.OpenAICompatibleProviderKey(providerName),
-			models:      buildOpenAICompatibilityConfigModels(compat),
+			models:      s.buildCompatConfigModels(cfg, compat),
 		}
 		cache.byIndex[i] = entry
 		if _, exists := cache.byName[key]; !exists {

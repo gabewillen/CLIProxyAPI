@@ -8,6 +8,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelconfig"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modellimits"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -199,7 +200,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 					return false
 				}
 				isCompatAuth = true
-				ms := buildOpenAICompatibilityConfigModels(compat)
+				ms := s.buildCompatConfigModels(s.cfg, compat)
 				if providerKey == "" {
 					providerKey = "openai-compatibility"
 				}
@@ -712,6 +713,13 @@ func buildConfiguredModelInfo(model modelEntry, ownedBy, modelType string, creat
 }
 
 func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []*ModelInfo {
+	return buildOpenAICompatibilityConfigModelsWithLimits(compat, nil)
+}
+
+// buildOpenAICompatibilityConfigModelsWithLimits builds compat models, filling
+// context/output limits from limits (keyed by upstream model name) for entries
+// without an explicit max-context-length. Explicit config always wins.
+func buildOpenAICompatibilityConfigModelsWithLimits(compat *config.OpenAICompatibility, limits map[string]modellimits.Resolved) []*ModelInfo {
 	if compat == nil || len(compat.Models) == 0 {
 		return nil
 	}
@@ -732,6 +740,7 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 			thinkingSupport = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 		}
 		info.Thinking = modelconfig.NormalizeThinkingSupport(thinkingSupport)
+		applyResolvedModelLimits(info, model, limits)
 		info.SupportedInputModalities = normalizeCompatConfigModalities(model.InputModalities)
 		info.SupportedOutputModalities = normalizeCompatConfigModalities(model.OutputModalities)
 		models = append(models, info)
@@ -1036,4 +1045,21 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 		}
 	}
 	return out
+}
+
+func applyResolvedModelLimits(info *ModelInfo, model config.OpenAICompatibilityModel, limits map[string]modellimits.Resolved) {
+	if info == nil || len(limits) == 0 {
+		return
+	}
+	resolved, ok := limits[strings.TrimSpace(model.Name)]
+	if !ok {
+		return
+	}
+	if model.MaxContextLength <= 0 && resolved.Context > 0 {
+		info.ContextLength = resolved.Context
+		info.MaxContextLength = resolved.Context
+	}
+	if info.MaxCompletionTokens <= 0 && resolved.Output > 0 {
+		info.MaxCompletionTokens = resolved.Output
+	}
 }
