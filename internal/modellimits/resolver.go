@@ -22,8 +22,9 @@ const (
 	DefaultTimeout = 3 * time.Second
 	// DefaultModelsDevRefresh is how often the models.dev catalog is re-fetched.
 	DefaultModelsDevRefresh = 24 * time.Hour
-	// upstreamCacheTTL is how long a provider /models result is reused across reloads.
-	upstreamCacheTTL = 10 * time.Minute
+	// UpstreamRefresh is how long a provider /models result is reused across
+	// reloads and how often auto-discovered models are re-checked.
+	UpstreamRefresh = 10 * time.Minute
 	// upstreamFailureTTL is how long a failed provider fetch is not retried.
 	upstreamFailureTTL = 1 * time.Minute
 	modelsDevCacheFile = "models-dev-cache.json"
@@ -60,6 +61,7 @@ type ProviderSpec struct {
 
 type upstreamEntry struct {
 	limits    map[string]Limits
+	ids       []string
 	fetchedAt time.Time
 	err       error
 }
@@ -106,8 +108,10 @@ func (r *Resolver) Options() Options {
 
 // Prefetch warms the upstream and models.dev caches for all specs in parallel,
 // waiting at most one timeout so registration is never delayed by more than that.
+// Upstream catalogs are fetched even when limit resolution is disabled so
+// model discovery can use them; models.dev is only fetched when enabled.
 func (r *Resolver) Prefetch(ctx context.Context, specs []ProviderSpec) {
-	if r == nil || !r.opts.Enabled {
+	if r == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, r.opts.Timeout)
@@ -120,10 +124,10 @@ func (r *Resolver) Prefetch(ctx context.Context, specs []ProviderSpec) {
 		wg.Add(1)
 		go func(spec ProviderSpec) {
 			defer wg.Done()
-			r.upstreamLimits(ctx, spec)
+			r.upstreamCatalog(ctx, spec)
 		}(spec)
 	}
-	if r.opts.ModelsDevURL != "" {
+	if r.opts.Enabled && r.opts.ModelsDevURL != "" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -142,7 +146,7 @@ func (r *Resolver) Resolve(ctx context.Context, spec ProviderSpec) map[string]Re
 	ctx, cancel := context.WithTimeout(ctx, r.opts.Timeout)
 	defer cancel()
 
-	upstream := r.upstreamLimits(ctx, spec)
+	upstream := r.upstreamCatalog(ctx, spec).limits
 	var catalog *ModelsDevCatalog
 	out := make(map[string]Resolved, len(spec.Models))
 	for _, model := range spec.Models {
@@ -167,42 +171,80 @@ func (r *Resolver) Resolve(ctx context.Context, spec ProviderSpec) map[string]Re
 	return out
 }
 
-func (r *Resolver) upstreamLimits(ctx context.Context, spec ProviderSpec) map[string]Limits {
+// UpstreamModels returns the model ids advertised by the provider's GET
+// {base-url}/models, reusing the same cached fetch as limit resolution. The
+// last successful list is kept while the upstream is unavailable; nil means
+// the catalog was never fetched successfully.
+func (r *Resolver) UpstreamModels(ctx context.Context, spec ProviderSpec) []string {
+	if r == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, r.opts.Timeout)
+	defer cancel()
+	entry := r.upstreamCatalog(ctx, spec)
+	if entry.ids == nil {
+		return nil
+	}
+	return append([]string(nil), entry.ids...)
+}
+
+// UpstreamStale reports whether the cached catalog for spec is older than the
+// upstream cache TTL (or absent), i.e. the next lookup would refetch.
+func (r *Resolver) UpstreamStale(spec ProviderSpec) bool {
+	if r == nil {
+		return false
+	}
 	baseURL := strings.TrimRight(strings.TrimSpace(spec.BaseURL), "/")
 	if baseURL == "" {
-		return nil
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry := r.upstream[baseURL+"\x00"+spec.APIKey]
+	return entry == nil || time.Since(entry.fetchedAt) >= UpstreamRefresh
+}
+
+func (r *Resolver) upstreamCatalog(ctx context.Context, spec ProviderSpec) upstreamEntry {
+	baseURL := strings.TrimRight(strings.TrimSpace(spec.BaseURL), "/")
+	if baseURL == "" {
+		return upstreamEntry{}
 	}
 	key := baseURL + "\x00" + spec.APIKey
 	r.mu.Lock()
 	entry := r.upstream[key]
 	if entry != nil {
-		ttl := upstreamCacheTTL
+		ttl := UpstreamRefresh
 		if entry.err != nil {
 			ttl = upstreamFailureTTL
 		}
 		if time.Since(entry.fetchedAt) < ttl {
 			r.mu.Unlock()
-			return entry.limits
+			return *entry
 		}
 	}
 	r.mu.Unlock()
 
-	limits, err := r.fetchUpstream(ctx, baseURL, spec)
+	catalog, err := r.fetchUpstream(ctx, baseURL, spec)
 	if err != nil {
 		log.Infof("model limits: provider %q upstream /models unavailable: %v", spec.Name, err)
-	} else if len(limits) == 0 {
+	} else if len(catalog.Limits) == 0 {
 		log.Infof("model limits: provider %q upstream /models carries no limit fields", spec.Name)
 	}
-	r.mu.Lock()
-	if err != nil && entry != nil && entry.limits != nil {
-		limits = entry.limits
+	next := &upstreamEntry{fetchedAt: time.Now(), err: err}
+	if err == nil {
+		next.limits = catalog.Limits
+		next.ids = catalog.IDs
+	} else if entry != nil {
+		next.limits = entry.limits
+		next.ids = entry.ids
 	}
-	r.upstream[key] = &upstreamEntry{limits: limits, fetchedAt: time.Now(), err: err}
+	r.mu.Lock()
+	r.upstream[key] = next
 	r.mu.Unlock()
-	return limits
+	return *next
 }
 
-func (r *Resolver) fetchUpstream(ctx context.Context, baseURL string, spec ProviderSpec) (map[string]Limits, error) {
+func (r *Resolver) fetchUpstream(ctx context.Context, baseURL string, spec ProviderSpec) (*UpstreamCatalog, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/models", nil)
 	if err != nil {
 		return nil, err
@@ -220,7 +262,11 @@ func (r *Resolver) fetchUpstream(ctx context.Context, baseURL string, spec Provi
 	if err != nil {
 		return nil, err
 	}
-	return ParseUpstreamModels(body), nil
+	catalog := ParseUpstreamCatalog(body)
+	if catalog == nil {
+		return nil, errors.New("invalid /models payload")
+	}
+	return catalog, nil
 }
 
 func (r *Resolver) do(req *http.Request) ([]byte, error) {

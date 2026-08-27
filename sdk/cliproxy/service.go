@@ -37,6 +37,7 @@ type Service struct {
 	// modelLimits resolves compat model context/output limits; guarded by modelLimitsMu.
 	modelLimits       *modellimits.Resolver
 	modelLimitsLogged map[string]string
+	autoModelsSeen    map[string][]string
 	modelLimitsMu     sync.Mutex
 
 	// codexLive caches live Codex catalogs per account; guarded by codexLiveMu.

@@ -92,3 +92,52 @@ func TestResolve_UpstreamFailureFallsBackToModelsDev(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 }
+
+func TestUpstreamModels_SharesFetchWithLimits(t *testing.T) {
+	hits := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"data":[{"id":"a","max_model_len":1024},{"id":"b"},{"id":"a"}]}`))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	resolver := New(Options{Enabled: true, Timeout: 2 * time.Second, HTTPClient: server.Client()})
+	spec := ProviderSpec{Name: "p", BaseURL: server.URL + "/v1/", Models: []string{"a"}}
+	if !resolver.UpstreamStale(spec) {
+		t.Fatal("never-fetched catalog must be stale")
+	}
+	ids := resolver.UpstreamModels(context.Background(), spec)
+	if len(ids) != 2 || ids[0] != "a" || ids[1] != "b" {
+		t.Fatalf("ids = %v, want [a b] (deduplicated, in order)", ids)
+	}
+	if got := resolver.Resolve(context.Background(), spec); got["a"].Context != 1024 {
+		t.Fatalf("limits = %+v", got)
+	}
+	if hits != 1 {
+		t.Fatalf("upstream fetched %d times, want 1 shared fetch", hits)
+	}
+	if resolver.UpstreamStale(spec) {
+		t.Fatal("fresh catalog must not be stale")
+	}
+}
+
+func TestUpstreamModels_DisabledLimitsStillDiscovers(t *testing.T) {
+	resolver, baseURL := newTestResolver(t, `{"data":[{"id":"x"}]}`, "", "")
+	resolver.opts.Enabled = false
+	spec := ProviderSpec{Name: "p", BaseURL: baseURL, APIKey: "secret", Models: []string{"x"}}
+	if ids := resolver.UpstreamModels(context.Background(), spec); len(ids) != 1 || ids[0] != "x" {
+		t.Fatalf("ids = %v", ids)
+	}
+	if got := resolver.Resolve(context.Background(), spec); got != nil {
+		t.Fatalf("limits must stay off when disabled, got %v", got)
+	}
+}
+
+func TestUpstreamModels_UnavailableReturnsNil(t *testing.T) {
+	resolver, baseURL := newTestResolver(t, "", "", "")
+	spec := ProviderSpec{Name: "p", BaseURL: baseURL, APIKey: "secret"}
+	if ids := resolver.UpstreamModels(context.Background(), spec); ids != nil {
+		t.Fatalf("ids = %v, want nil when upstream never answered", ids)
+	}
+}

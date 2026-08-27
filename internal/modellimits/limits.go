@@ -48,11 +48,30 @@ var upstreamOutputKeys = []string{
 	"max_tokens",
 }
 
+// UpstreamCatalog is the parsed result of one provider GET /models payload.
+type UpstreamCatalog struct {
+	// IDs lists every model id in payload order, deduplicated.
+	IDs []string
+	// Limits holds the entries that carried a limit field, keyed by id.
+	Limits map[string]Limits
+}
+
 // ParseUpstreamModels extracts limits from an OpenAI-style GET /models payload.
-// It accepts a top-level "data" (OpenAI, vLLM, OpenRouter, LiteLLM) or "models"
-// list, and reads limit fields from the entry itself or from nested
-// "top_provider"/"limit" objects (OpenRouter/models.dev style).
+// See ParseUpstreamCatalog for the accepted shapes.
 func ParseUpstreamModels(raw []byte) map[string]Limits {
+	catalog := ParseUpstreamCatalog(raw)
+	if catalog == nil {
+		return nil
+	}
+	return catalog.Limits
+}
+
+// ParseUpstreamCatalog parses an OpenAI-style GET /models payload into model
+// ids and limits. It accepts a top-level "data" (OpenAI, vLLM, OpenRouter,
+// LiteLLM) or "models" list, and reads limit fields from the entry itself or
+// from nested "top_provider"/"limit" objects (OpenRouter/models.dev style).
+// It returns nil for payloads that are not JSON.
+func ParseUpstreamCatalog(raw []byte) *UpstreamCatalog {
 	var payload struct {
 		Data   []map[string]any `json:"data"`
 		Models []map[string]any `json:"models"`
@@ -64,7 +83,9 @@ func ParseUpstreamModels(raw []byte) map[string]Limits {
 	if len(entries) == 0 {
 		entries = payload.Models
 	}
+	catalog := &UpstreamCatalog{IDs: make([]string, 0, len(entries))}
 	out := make(map[string]Limits, len(entries))
+	seen := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		id := strings.TrimSpace(stringValue(entry["id"]))
 		if id == "" {
@@ -72,6 +93,10 @@ func ParseUpstreamModels(raw []byte) map[string]Limits {
 		}
 		if id == "" {
 			continue
+		}
+		if _, dup := seen[id]; !dup {
+			seen[id] = struct{}{}
+			catalog.IDs = append(catalog.IDs, id)
 		}
 		limits := Limits{
 			Context: firstInt(entry, upstreamContextKeys),
@@ -94,10 +119,10 @@ func ParseUpstreamModels(raw []byte) map[string]Limits {
 		}
 		out[id] = limits
 	}
-	if len(out) == 0 {
-		return nil
+	if len(out) > 0 {
+		catalog.Limits = out
 	}
-	return out
+	return catalog
 }
 
 func firstInt(entry map[string]any, keys []string) int {

@@ -328,6 +328,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if hash := diff.ComputeOpenAICompatModelsHash(compat.Models); hash != "" {
 				attrs["models_hash"] = hash
 			}
+			addAutoModelsToAttrs(compat, attrs)
 			addConfigHeadersToAttrs(compat.Headers, attrs)
 			a := &coreauth.Auth{
 				ID:         id,
@@ -370,6 +371,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if hash := diff.ComputeOpenAICompatModelsHash(compat.Models); hash != "" {
 				attrs["models_hash"] = hash
 			}
+			addAutoModelsToAttrs(compat, attrs)
 			addConfigHeadersToAttrs(compat.Headers, attrs)
 			a := &coreauth.Auth{
 				ID:         id,
@@ -449,4 +451,16 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		out = append(out, a)
 	}
 	return out
+}
+
+// addAutoModelsToAttrs records the auto-models settings so toggling them on a
+// config reload changes the auth and triggers model re-registration.
+func addAutoModelsToAttrs(compat *config.OpenAICompatibility, attrs map[string]string) {
+	if compat == nil || !compat.AutoModels {
+		return
+	}
+	attrs["auto_models"] = "true"
+	if len(compat.AutoModelsExclude) > 0 {
+		attrs["auto_models_exclude"] = strings.Join(compat.AutoModelsExclude, ",")
+	}
 }

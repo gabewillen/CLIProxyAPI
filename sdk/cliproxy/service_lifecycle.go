@@ -199,6 +199,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.registerModelRefreshCallback()
 	s.startCodexLiveModelsRefresh(ctx)
+	s.startCompatAutoModelsRefresh(ctx)
 
 	// Prefer core auth manager auto refresh if available.
 	if s.coreManager != nil && !homeEnabled {

@@ -669,6 +669,15 @@ type OpenAICompatibility struct {
 	// Models defines the model configurations including aliases for routing.
 	Models []OpenAICompatibilityModel `yaml:"models" json:"models"`
 
+	// AutoModels registers every model id advertised by the provider's
+	// GET {base-url}/models in addition to Models. Configured entries keep
+	// their alias and settings; discovered ids are served under their upstream id.
+	AutoModels bool `yaml:"auto-models,omitempty" json:"auto-models,omitempty"`
+
+	// AutoModelsExclude lists path.Match globs (case-insensitive) of upstream
+	// model ids that AutoModels must not register (e.g. "gpt-*").
+	AutoModelsExclude []string `yaml:"auto-models-exclude,omitempty" json:"auto-models-exclude,omitempty"`
+
 	// Headers optionally adds extra HTTP headers for requests sent to this provider.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 

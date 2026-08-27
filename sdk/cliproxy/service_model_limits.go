@@ -40,13 +40,14 @@ func sameModelLimitsOptions(a, b modellimits.Options) bool {
 }
 
 // modelLimitsResolver returns the shared resolver for cfg, rebuilding it only
-// when the relevant options changed so caches survive config reloads.
+// when the relevant options changed so caches survive config reloads. It is
+// nil when neither limit resolution nor auto-models needs it.
 func (s *Service) modelLimitsResolver(cfg *config.Config) *modellimits.Resolver {
 	if s == nil {
 		return nil
 	}
 	opts := modelLimitsOptions(cfg)
-	if !opts.Enabled {
+	if !opts.Enabled && !anyCompatAutoModels(cfg) {
 		return nil
 	}
 	s.modelLimitsMu.Lock()
@@ -90,7 +91,7 @@ func (s *Service) prefetchModelLimits(cfg *config.Config) {
 		if compat.Disabled {
 			continue
 		}
-		if spec := compatProviderSpec(compat); len(spec.Models) > 0 {
+		if spec := compatProviderSpec(compat); len(spec.Models) > 0 || compat.AutoModels {
 			specs = append(specs, spec)
 		}
 	}
@@ -100,13 +101,17 @@ func (s *Service) prefetchModelLimits(cfg *config.Config) {
 	resolver.Prefetch(context.Background(), specs)
 }
 
-// buildCompatConfigModels builds compat models and fills in auto-resolved limits.
+// buildCompatConfigModels builds compat models, unions auto-discovered upstream
+// models when enabled, and fills in auto-resolved limits.
 func (s *Service) buildCompatConfigModels(cfg *config.Config, compat *config.OpenAICompatibility) []*ModelInfo {
 	resolver := s.modelLimitsResolver(cfg)
 	if resolver == nil || compat == nil {
 		return buildOpenAICompatibilityConfigModels(compat)
 	}
 	spec := compatProviderSpec(compat)
+	if compat.AutoModels {
+		compat = s.withDiscoveredCompatModels(resolver, compat, &spec)
+	}
 	if len(spec.Models) == 0 {
 		return buildOpenAICompatibilityConfigModels(compat)
 	}
